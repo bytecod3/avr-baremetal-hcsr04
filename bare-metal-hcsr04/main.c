@@ -13,11 +13,6 @@
 #define HCSR04_ECHO_PIN		PK7
 #define TRIG_PULSE_LENGTH	10 // trigger length in us
 
-volatile int c = 0;
-ISR(TIMER1_COMPA_vect) {
-	PORTB ^= (1<<PB7);
-}
-
 void hcsro4_init() {
 	DDRK |= (1<<PK0); // trigger pin output 
 }
@@ -31,68 +26,84 @@ void hcsro4_trigger() {
 uint16_t hcsro4_get_pulse_width() {
 	// measure pulse duration received from the echo pin
 	uint32_t i, result;
+	uint16_t ticks;
 	
-	// set timeout of waiting for the pin
-	for(i=0; i<60000; i++) {
-		if(!(PINK & (1<<PK1))) {
-			continue; // line is low
+	// set timer 1 to measure 38ms timeout 
+	TCCR1A |= (1<<WGM12);	// start timer in CTC mode
+	TCCR1B |= (1<<CS12);	// pre-scale to 256
+	OCR1A = 2374;			// count 38ms
+	
+	// check for high pulse on the echo pin after trigger pulse is released
+	// will wait for 38 ms, if 38ms pass, echo pin is faulty 
+	while(!(TIFR1 & (1<<OCF1A))) {
+		if(!(HCSR04_PIN & (1<<HCSR04_ECHO_PIN))) {
+			continue; // ECHO pin is LOW continue
 		} else {
-			break; // detect a transition to HIGH
+			TIFR1 &= ~(1<<OCF1A); 
+			break; // HIGH on ECHO pin detected, break loop
 		}
 	}
 	
-	// check the echo pin for a given amount of time 
+	// check if OCF bit was cleared successfully
+	if(TIFR1 & (1<<OCF1A))	 {
+		return -1; // failed to activate echo pin
+	} 	
 	
-	// if timeout detected, return ERROR
-	if(i==60000) {
-		return -1;
+	// wait for FALLING EDGE on the ECHO pin - polling 
+	while(!(TIFR1 & (1<<OCF1A))) {
+		if(!(HCSR04_PIN & (1<<HCSR04_ECHO_PIN))) { // falling edge detected
+			ticks = TCNT1;
+			TCNT1 = 0x00;
+			TCCR1A = 0x00; // stop timer 
+			TIFR1 &= ~(1<<OCF1A);
+			break;
+		} else {
+			continue;
+		}
 	}
 	
-	// set up timer 1
-	TCCR1A = 0x00;
-	TCCR1B |= (1<<CS11); // pre-scale by 8 (T=500nS)
-	TCNT1 = 0x00;
-}
-
-
-void timer3_check_timeout() {
-	TCCR3A = 0x00;
-	TCCR3B |= (1<<CS30); // no pre-scaling
-	uint16_t v = 608;
-	TCNT3 = 0x00;
+	// check if the OCF1A flag is still 0, meaning timeout on the ECHO pin
+	// if 38ms pass without detecting a LOW on the ECHO pin, then there is no obstacle on that side
+	if(TIFR1 & (1<<OCF1A))	 {
+		return -2; // no obstacle in range
+	} 
 	
-	if(TCNT3 == v) {
-		// 38 ms reached, reset counter
-		TCNT3 = 0x00;
-		debug_via_usart("38MS");
-	}
+	return ticks;
+	
 }
+
 
 void onboard_led_init() {
 	DDRB |= (1<<PB7);
 }
 
-
-void timer1_CTC_mode() {
-	TCCR1B |= (1<<WGM12); // CTC mode 
-	TCCR1B |= (1<<CS12); // set pre-scaler to 256
-	OCR1A = 31249; // compare value for 500ms (see docs for calculation)
-	TIMSK1 |= (1<<OCIE1A); // enable interrupt
-	//TCCR1A |= (1<<COM1A0); // toggle output on compare match
-	sei();
-}
-
 int main(void)
 {
+	hcsro4_init();
     usart_init();
-	char m[] = "Hello USONIC\n";
-	
 	onboard_led_init();
-	//DDRB |= (1<<PB5);
-	timer1_CTC_mode();
+	
+	char m[] = "Hello USONIC\n";
+	char d_buff[20];
+	uint16_t r = 0;
 	
     while (1) 
     {
+		hcsro4_trigger();
+		r = hcsro4_get_pulse_width();
+		
+		if(r == -1) {
+			debug_via_usart("Sensor error");
+		} else if(r == -2) {
+			debug_via_usart("No obstacle in range");
+		} else {
+			// calculate the distance 
+			uint16_t pulse_width = r * (16E-6);
+			uint16_t distance = (pulse_width * 340) * 100; // distance in centimeters
+			sprintf(d_buff, "%d\n", distance);
+			debug_via_usart(d_buff);
+			_delay_ms(10);
+		}
 		
     }
 }
